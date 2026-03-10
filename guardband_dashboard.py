@@ -1,0 +1,556 @@
+import socket
+import json
+import threading
+import time
+import tkinter as tk
+from tkinter import ttk
+from collections import deque
+import matplotlib
+matplotlib.use('TkAgg')
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from matplotlib import animation
+import math
+
+ESP32_PORT = 9000
+MAX_POINTS = 300
+
+# ── Color Palette ─────────────────────────────────────────────
+BG_DARK    = "#050a0e"
+BG_PANEL   = "#0a1520"
+BG_CARD    = "#0d1f2d"
+ACCENT     = "#00d4ff"
+ACCENT2    = "#00ff88"
+WARN       = "#ffaa00"
+DANGER     = "#ff3366"
+TEXT_DIM   = "#3a5a6a"
+TEXT_MID   = "#6a9ab0"
+TEXT_LIGHT = "#a8d8ea"
+TEXT_WHITE = "#e8f4f8"
+AX_COLOR   = "#ff6b9d"
+AY_COLOR   = "#00ff88"
+AZ_COLOR   = "#00d4ff"
+MAG_COLOR  = "#ffaa00"
+
+class AnimatedValue:
+    def __init__(self, initial=0):
+        self.current = initial
+        self.target = initial
+
+    def update(self, target):
+        self.target = target
+        self.current += (self.target - self.current) * 0.3
+
+class GuardBandDashboard:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("GuardBand AI")
+        self.root.geometry("1300x800")
+        self.root.configure(bg=BG_DARK)
+        self.root.resizable(True, True)
+
+        self.ax_data   = deque(maxlen=MAX_POINTS)
+        self.ay_data   = deque(maxlen=MAX_POINTS)
+        self.az_data   = deque(maxlen=MAX_POINTS)
+        self.mag_data  = deque(maxlen=MAX_POINTS)
+        self.time_data = deque(maxlen=MAX_POINTS)
+        self.start_time = time.time()
+
+        self.connected = False
+        self.esp32_ip  = tk.StringVar(value="192.168.0.129")
+        self.sock      = None
+
+        self.anim_vals = {
+            "ax":  AnimatedValue(),
+            "ay":  AnimatedValue(),
+            "az":  AnimatedValue(1),
+            "mag": AnimatedValue(1),
+        }
+
+        self.pulse_angle = 0
+        self.alert_flash = 0
+        self.current_state = 1
+        self.current_anomaly = ""
+        self.log_entries = []
+
+        self.build_ui()
+        self.animate_ui()
+        self.update_plots()
+
+    # ──────────────────────────────────────────────────────────
+    def build_ui(self):
+        # ── Top Header
+        header = tk.Frame(self.root, bg=BG_DARK, height=70)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+
+        # Left logo area
+        logo_frame = tk.Frame(header, bg=BG_DARK)
+        logo_frame.pack(side=tk.LEFT, padx=20, pady=10)
+
+        self.pulse_canvas = tk.Canvas(logo_frame, width=40, height=40,
+                                       bg=BG_DARK, highlightthickness=0)
+        self.pulse_canvas.pack(side=tk.LEFT, padx=(0, 10))
+
+        title_frame = tk.Frame(logo_frame, bg=BG_DARK)
+        title_frame.pack(side=tk.LEFT)
+
+        tk.Label(title_frame, text="GUARDBAND AI",
+                 bg=BG_DARK, fg=ACCENT,
+                 font=("Courier", 20, "bold")).pack(anchor=tk.W)
+        tk.Label(title_frame, text="Smart Fall Detection & AI Anomaly System",
+                 bg=BG_DARK, fg=TEXT_DIM,
+                 font=("Courier", 9)).pack(anchor=tk.W)
+
+        # Right status
+        right_header = tk.Frame(header, bg=BG_DARK)
+        right_header.pack(side=tk.RIGHT, padx=20)
+
+        self.conn_dot = tk.Canvas(right_header, width=12, height=12,
+                                   bg=BG_DARK, highlightthickness=0)
+        self.conn_dot.pack(side=tk.LEFT, padx=(0, 6))
+        self.conn_dot.create_oval(1, 1, 11, 11, fill=DANGER, outline="", tags="dot")
+
+        self.conn_label = tk.Label(right_header, text="OFFLINE",
+                                    bg=BG_DARK, fg=DANGER,
+                                    font=("Courier", 11, "bold"))
+        self.conn_label.pack(side=tk.LEFT)
+
+        # Separator line
+        sep = tk.Canvas(self.root, height=1, bg=BG_DARK, highlightthickness=0)
+        sep.pack(fill=tk.X)
+        sep.create_line(0, 0, 2000, 0, fill=ACCENT, width=1)
+
+        # ── Main Layout
+        main = tk.Frame(self.root, bg=BG_DARK)
+        main.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+
+        # ── Left column
+        left = tk.Frame(main, bg=BG_DARK)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Connection bar
+        conn_bar = tk.Frame(left, bg=BG_PANEL, pady=8)
+        conn_bar.pack(fill=tk.X, pady=(0, 8))
+
+        tk.Label(conn_bar, text="ESP32 IP",
+                 bg=BG_PANEL, fg=TEXT_DIM,
+                 font=("Courier", 9)).pack(side=tk.LEFT, padx=(12, 4))
+
+        self.ip_entry = tk.Entry(conn_bar, textvariable=self.esp32_ip,
+                                  bg=BG_CARD, fg=ACCENT,
+                                  font=("Courier", 11), width=16,
+                                  insertbackground=ACCENT,
+                                  relief=tk.FLAT, bd=4)
+        self.ip_entry.pack(side=tk.LEFT, padx=4)
+
+        self.connect_btn = tk.Button(conn_bar, text="[ CONNECT ]",
+                                      bg=BG_PANEL, fg=ACCENT2,
+                                      font=("Courier", 10, "bold"),
+                                      command=self.connect,
+                                      relief=tk.FLAT, bd=0,
+                                      activebackground=BG_CARD,
+                                      activeforeground=ACCENT2,
+                                      cursor="hand2")
+        self.connect_btn.pack(side=tk.LEFT, padx=8)
+
+        self.disconnect_btn = tk.Button(conn_bar, text="[ DISCONNECT ]",
+                                         bg=BG_PANEL, fg=DANGER,
+                                         font=("Courier", 10, "bold"),
+                                         command=self.disconnect,
+                                         relief=tk.FLAT, bd=0,
+                                         activebackground=BG_CARD,
+                                         activeforeground=DANGER,
+                                         cursor="hand2")
+        self.disconnect_btn.pack(side=tk.LEFT)
+
+        self.time_label = tk.Label(conn_bar, text="",
+                                    bg=BG_PANEL, fg=TEXT_DIM,
+                                    font=("Courier", 9))
+        self.time_label.pack(side=tk.RIGHT, padx=12)
+
+        # Charts
+        self.fig = Figure(figsize=(8, 5), facecolor=BG_DARK)
+        self.fig.subplots_adjust(hspace=0.4, left=0.08, right=0.97,
+                                  top=0.92, bottom=0.08)
+
+        self.plot_ax1 = self.fig.add_subplot(2, 1, 1)
+        self.plot_ax2 = self.fig.add_subplot(2, 1, 2)
+
+        for ax in [self.plot_ax1, self.plot_ax2]:
+            ax.set_facecolor(BG_PANEL)
+            ax.tick_params(colors=TEXT_DIM, labelsize=7)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(TEXT_DIM)
+                spine.set_linewidth(0.5)
+            ax.grid(color=BG_CARD, linewidth=0.5, alpha=0.8)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=left)
+        self.canvas.get_tk_widget().configure(bg=BG_DARK)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # ── Right column
+        right = tk.Frame(main, bg=BG_DARK, width=300)
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+        right.pack_propagate(False)
+
+        # Status card
+        self._section_label(right, "PATIENT STATUS")
+
+        self.status_frame = tk.Frame(right, bg=BG_CARD, pady=16)
+        self.status_frame.pack(fill=tk.X, pady=(2, 8))
+
+        self.status_label = tk.Label(self.status_frame,
+                                      text="NORMAL",
+                                      bg=BG_CARD, fg=ACCENT2,
+                                      font=("Courier", 24, "bold"))
+        self.status_label.pack()
+
+        self.status_sub = tk.Label(self.status_frame,
+                                    text="All systems nominal",
+                                    bg=BG_CARD, fg=TEXT_DIM,
+                                    font=("Courier", 8))
+        self.status_sub.pack()
+
+        # Anomaly card
+        self._section_label(right, "AI ANOMALY DETECTION")
+
+        self.anomaly_frame = tk.Frame(right, bg=BG_CARD, pady=10)
+        self.anomaly_frame.pack(fill=tk.X, pady=(2, 8))
+
+        self.anomaly_icon = tk.Label(self.anomaly_frame,
+                                      text="◉",
+                                      bg=BG_CARD, fg=ACCENT2,
+                                      font=("Courier", 14))
+        self.anomaly_icon.pack()
+
+        self.anomaly_label = tk.Label(self.anomaly_frame,
+                                       text="Monitoring...",
+                                       bg=BG_CARD, fg=ACCENT,
+                                       font=("Courier", 11, "bold"))
+        self.anomaly_label.pack()
+
+        # Live readings
+        self._section_label(right, "LIVE SENSOR DATA")
+
+        readings_frame = tk.Frame(right, bg=BG_CARD, pady=8)
+        readings_frame.pack(fill=tk.X, pady=(2, 8))
+
+        self.reading_bars = {}
+        for name, color, label in [
+            ("ax",  AX_COLOR,  "Ax"),
+            ("ay",  AY_COLOR,  "Ay"),
+            ("az",  AZ_COLOR,  "Az"),
+            ("mag", MAG_COLOR, "|a|"),
+        ]:
+            row = tk.Frame(readings_frame, bg=BG_CARD)
+            row.pack(fill=tk.X, padx=10, pady=3)
+
+            tk.Label(row, text=label,
+                     bg=BG_CARD, fg=color,
+                     font=("Courier", 10, "bold"),
+                     width=4, anchor=tk.W).pack(side=tk.LEFT)
+
+            bar_canvas = tk.Canvas(row, height=14, bg=BG_PANEL,
+                                    highlightthickness=0, width=140)
+            bar_canvas.pack(side=tk.LEFT, padx=4)
+
+            val_label = tk.Label(row, text="0.00 g",
+                                  bg=BG_CARD, fg=color,
+                                  font=("Courier", 10),
+                                  width=8, anchor=tk.E)
+            val_label.pack(side=tk.RIGHT)
+
+            self.reading_bars[name] = (bar_canvas, val_label, color)
+
+        # Event log
+        self._section_label(right, "EVENT LOG")
+
+        log_frame = tk.Frame(right, bg=BG_CARD)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
+
+        self.log_text = tk.Text(log_frame,
+                                 bg=BG_DARK, fg=TEXT_MID,
+                                 font=("Courier", 8),
+                                 state=tk.DISABLED,
+                                 relief=tk.FLAT,
+                                 selectbackground=BG_PANEL)
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        self.log_text.tag_config("emergency", foreground=DANGER)
+        self.log_text.tag_config("warning",   foreground=WARN)
+        self.log_text.tag_config("info",      foreground=ACCENT)
+        self.log_text.tag_config("normal",    foreground=ACCENT2)
+
+    def _section_label(self, parent, text):
+        frame = tk.Frame(parent, bg=BG_DARK)
+        frame.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(frame, text=f"  {text}",
+                 bg=BG_DARK, fg=TEXT_DIM,
+                 font=("Courier", 8, "bold")).pack(side=tk.LEFT)
+        line = tk.Canvas(frame, height=1, bg=BG_DARK,
+                          highlightthickness=0)
+        line.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        line.create_line(0, 0, 500, 0, fill=TEXT_DIM, width=1)
+
+    # ── Animation loop
+    def animate_ui(self):
+        self.pulse_angle += 0.05
+        self.alert_flash += 0.08
+
+        # Pulse circle in header
+        self.pulse_canvas.delete("all")
+        cx, cy, r = 20, 20, 14
+        # Outer pulse ring
+        pr = r + 4 + int(3 * math.sin(self.pulse_angle))
+        color = ACCENT if self.connected else TEXT_DIM
+        self.pulse_canvas.create_oval(cx-pr, cy-pr, cx+pr, cy+pr,
+                                       outline=color, width=1)
+        self.pulse_canvas.create_oval(cx-r, cy-r, cx+r, cy+r,
+                                       fill=color, outline="")
+
+        # Update time
+        self.time_label.config(text=time.strftime("  %H:%M:%S"))
+
+        # Flash anomaly icon
+        if self.current_anomaly:
+            alpha = int(127 + 127 * math.sin(self.alert_flash))
+            hex_color = f"#{alpha:02x}{alpha//3:02x}00"
+            self.anomaly_icon.config(fg=hex_color)
+
+        # Update reading bars
+        for name, (bar, val_label, color) in self.reading_bars.items():
+            self.anim_vals[name].update(
+                float(val_label.cget("text").replace(" g", "") or 0)
+            )
+            bar.delete("all")
+            # Background
+            bar.create_rectangle(0, 0, 140, 14,
+                                   fill=BG_PANEL, outline="")
+            # Value bar (normalized 0-2g range)
+            raw = abs(self.anim_vals[name].current)
+            width = min(int(raw * 70), 140)
+            if width > 0:
+                bar.create_rectangle(0, 2, width, 12,
+                                      fill=color, outline="")
+
+        self.root.after(50, self.animate_ui)
+
+    # ── Plotting
+    def update_plots(self):
+        if len(self.time_data) > 2:
+            t = list(self.time_data)
+
+            self.plot_ax1.clear()
+            self.plot_ax1.set_facecolor(BG_PANEL)
+            self.plot_ax1.fill_between(t, list(self.ax_data),
+                                        alpha=0.15, color=AX_COLOR)
+            self.plot_ax1.fill_between(t, list(self.ay_data),
+                                        alpha=0.15, color=AY_COLOR)
+            self.plot_ax1.plot(t, list(self.ax_data),
+                                color=AX_COLOR, linewidth=1.2,
+                                label="Ax")
+            self.plot_ax1.plot(t, list(self.ay_data),
+                                color=AY_COLOR, linewidth=1.2,
+                                label="Ay")
+            self.plot_ax1.plot(t, list(self.az_data),
+                                color=AZ_COLOR, linewidth=1.2,
+                                label="Az")
+            self.plot_ax1.axhline(1.8, color=DANGER,
+                                   linestyle="--", linewidth=0.8,
+                                   alpha=0.6)
+            self.plot_ax1.axhline(0.6, color=WARN,
+                                   linestyle="--", linewidth=0.8,
+                                   alpha=0.6)
+            self.plot_ax1.set_title("ACCELERATION (g)",
+                                     color=TEXT_MID, fontsize=8,
+                                     fontfamily="monospace", pad=4)
+            self.plot_ax1.legend(facecolor=BG_CARD,
+                                  labelcolor=TEXT_LIGHT,
+                                  fontsize=7, loc="upper right",
+                                  framealpha=0.8)
+            self.plot_ax1.tick_params(colors=TEXT_DIM, labelsize=7)
+            for spine in self.plot_ax1.spines.values():
+                spine.set_edgecolor(TEXT_DIM)
+                spine.set_linewidth(0.5)
+            self.plot_ax1.grid(color=BG_CARD, linewidth=0.5)
+
+            self.plot_ax2.clear()
+            self.plot_ax2.set_facecolor(BG_PANEL)
+            self.plot_ax2.fill_between(t, list(self.mag_data),
+                                        alpha=0.2, color=MAG_COLOR)
+            self.plot_ax2.plot(t, list(self.mag_data),
+                                color=MAG_COLOR, linewidth=1.5)
+            self.plot_ax2.axhline(1.8, color=DANGER,
+                                   linestyle="--", linewidth=0.8,
+                                   alpha=0.6, label="Impact threshold")
+            self.plot_ax2.axhline(0.6, color=WARN,
+                                   linestyle="--", linewidth=0.8,
+                                   alpha=0.6, label="Freefall threshold")
+            self.plot_ax2.set_title("MAGNITUDE |a| (g)",
+                                     color=TEXT_MID, fontsize=8,
+                                     fontfamily="monospace", pad=4)
+            self.plot_ax2.legend(facecolor=BG_CARD,
+                                  labelcolor=TEXT_LIGHT,
+                                  fontsize=7, loc="upper right",
+                                  framealpha=0.8)
+            self.plot_ax2.tick_params(colors=TEXT_DIM, labelsize=7)
+            for spine in self.plot_ax2.spines.values():
+                spine.set_edgecolor(TEXT_DIM)
+                spine.set_linewidth(0.5)
+            self.plot_ax2.grid(color=BG_CARD, linewidth=0.5)
+
+            self.fig.tight_layout(pad=1.5)
+            self.canvas.draw()
+
+        self.root.after(150, self.update_plots)
+
+    # ── Logging
+    def log(self, msg, tag="info"):
+        ts = time.strftime("%H:%M:%S")
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, f"[{ts}] {msg}\n", tag)
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    # ── Connection
+    def connect(self):
+        ip = self.esp32_ip.get().strip()
+        threading.Thread(target=self._connect_thread,
+                         args=(ip,), daemon=True).start()
+
+    def _connect_thread(self, ip):
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(5)
+            self.sock.connect((ip, ESP32_PORT))
+            self.sock.settimeout(None)
+            self.connected = True
+            self.root.after(0, self._on_connected, ip)
+            self._receive_loop()
+        except Exception as e:
+            self.connected = False
+            self.root.after(0, self._on_failed, str(e))
+
+    def _on_connected(self, ip):
+        self.conn_label.config(text="CONNECTED", fg=ACCENT2)
+        self.conn_dot.itemconfig("dot", fill=ACCENT2)
+        self.log(f"Connected to {ip}:{ESP32_PORT}", "normal")
+
+    def _on_failed(self, err):
+        self.conn_label.config(text="FAILED", fg=DANGER)
+        self.conn_dot.itemconfig("dot", fill=DANGER)
+        self.log(f"Failed: {err}", "emergency")
+
+    def disconnect(self):
+        self.connected = False
+        try:
+            self.sock.close()
+        except:
+            pass
+        self.conn_label.config(text="OFFLINE", fg=DANGER)
+        self.conn_dot.itemconfig("dot", fill=DANGER)
+        self.log("Disconnected", "warning")
+
+    def _receive_loop(self):
+        buf = ""
+        while self.connected:
+            try:
+                chunk = self.sock.recv(4096).decode("utf-8", errors="ignore")
+                if not chunk:
+                    break
+                buf += chunk
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        try:
+                            data = json.loads(line)
+                            self.root.after(0, lambda d=data: self.process(d))
+                        except:
+                            pass
+            except:
+                break
+        self.connected = False
+        self.root.after(0, lambda: self.conn_label.config(
+            text="OFFLINE", fg=DANGER))
+
+    # ── Data Processing
+    def process(self, data):
+        msg_type = data.get("type", "")
+
+        if msg_type == "sensor":
+            ax  = data.get("ax",  0)
+            ay  = data.get("ay",  0)
+            az  = data.get("az",  0)
+            mag = data.get("mag", 0)
+            t   = time.time() - self.start_time
+
+            self.ax_data.append(ax)
+            self.ay_data.append(ay)
+            self.az_data.append(az)
+            self.mag_data.append(mag)
+            self.time_data.append(t)
+
+            # Update reading labels
+            self.reading_bars["ax"][1].config(text=f"{ax:+.2f} g")
+            self.reading_bars["ay"][1].config(text=f"{ay:+.2f} g")
+            self.reading_bars["az"][1].config(text=f"{az:+.2f} g")
+            self.reading_bars["mag"][1].config(text=f"{mag:.2f} g")
+
+            state = data.get("state", 1)
+            self.current_state = state
+            state_map = {
+                0: ("CALIBRATING", WARN,   "Learning movement patterns..."),
+                1: ("NORMAL",      ACCENT2, "All systems nominal"),
+                2: ("FREEFALL",    WARN,   "Free-fall detected!"),
+                3: ("IMPACT",      DANGER, "Impact detected!"),
+                4: ("FALL!",       DANGER, "Fall confirmed!"),
+                5: ("EMERGENCY",   DANGER, "EMERGENCY - Send help!"),
+            }
+            label, color, sub = state_map.get(state, ("UNKNOWN", TEXT_DIM, ""))
+            self.status_label.config(text=label, fg=color)
+            self.status_sub.config(text=sub)
+
+        elif msg_type == "anomaly":
+            anomaly = data.get("anomaly", "")
+            labels = {
+                "unusual_movement": "Unusual Movement",
+                "tremor":           "Tremor Detected",
+                "no_movement":      "No Movement!",
+                "slow_collapse":    "Slow Collapse!"
+            }
+            label = labels.get(anomaly, anomaly)
+            self.current_anomaly = label
+            self.anomaly_label.config(text=label, fg=WARN)
+            self.anomaly_icon.config(fg=WARN)
+            self.log(f"AI: {label}", "warning")
+            self.root.after(10000, self._clear_anomaly)
+
+        elif msg_type == "fall":
+            peak = data.get("peakG", 0)
+            self.log(f"FALL CONFIRMED! Peak: {peak:.2f}g", "emergency")
+            self.status_label.config(text="FALL!", fg=DANGER)
+
+        elif msg_type == "emergency":
+            peak = data.get("peakG", 0)
+            self.log(f"EMERGENCY! Peak: {peak:.2f}g", "emergency")
+            self.status_label.config(text="EMERGENCY", fg=DANGER)
+
+        elif msg_type == "calibration":
+            mean = data.get("mean", 0)
+            std  = data.get("std",  0)
+            self.log(f"AI calibrated: mean={mean:.2f} std={std:.2f}", "normal")
+            self.anomaly_label.config(text="AI Active", fg=ACCENT2)
+            self.anomaly_icon.config(fg=ACCENT2)
+
+    def _clear_anomaly(self):
+        self.current_anomaly = ""
+        self.anomaly_label.config(text="Monitoring...", fg=ACCENT)
+        self.anomaly_icon.config(fg=ACCENT2)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = GuardBandDashboard(root)
+    root.mainloop()
